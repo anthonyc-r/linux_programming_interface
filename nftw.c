@@ -11,6 +11,7 @@ An implementation of nftw.
 #include <errno.h>
 #include <limits.h>
 
+// TODO: - Handle CHDIR, ACTIONRETVAL & MOUNT
 #define FTW_ACTIONRETVAL 0
 #define FTW_CHDIR 1
 #define FTW_DEPTH 2
@@ -39,6 +40,7 @@ enum FTW_FTYPE {
 	FTW_SLN
 };
 
+// TODO: - Handle fn returns.
 enum FTW_ACTION_RET {
 	FTW_CONTINUE,
 	FTW_SKIP_SIBLINGS,
@@ -46,98 +48,142 @@ enum FTW_ACTION_RET {
 	FTW_STOP
 };
 
-void iterate_through(const char *dir, int flags) {
-	
-}
 
+// TODO: - Respect noopenfd value
 int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf), int noopenfd, int flags) {
-	int base, level, fdcount, fpath_len;
+	int fpath_len, statcode;
 	// silence warning, bpath+d_name wont be > PATH_MAX.
 	char fpath[PATH_MAX + 256], bpath[PATH_MAX];
-	struct stat sb;
+	struct stat sb, sb_linkcheck;
 	struct FTW ftwb;
 	DIR *dp_outer, *dp;
 	struct dirent *dirent;
-	struct link head;
-	struct link *clink;
+	struct link *head, *clink;
+	int (*statfn) (const char *pathname, struct stat *statbuf);
+	
+	// We use lstat instead of stat if FTW_PHYS is specified to enable the 
+	// `else if ((sb.st_mode & S_IFMT) == S_IFLNK)` branch below, else stat just follows
+	// links.
+	if (flags & FTW_PHYS) {
+		statfn = lstat;
+	} else {
+		statfn = stat;
+	}
 	
 	// Set up data for current depth
-	level = 0;
-	fdcount = 1;
 	if (realpath(dirpath, bpath) == NULL)
 		return -1;
-	// Consider FTW_DNR, then return.
+	// Can't open the dirpath, return error
 	if ((dp_outer = opendir(dirpath)) == NULL)
 		return -1;
-	head.dir = dp_outer;
-	head.next = NULL;
-	head.prev = NULL;
-	head.path_end = strnlen(bpath, PATH_MAX);
-	clink = &head;
+	// Setup ftwb for level 0
+	ftwb.level = 0;
+	ftwb.base = strnlen(dirpath, PATH_MAX);
+	// Use a linked list of DIR* to keep track of where we're at in the tree walk
+	// Just convenient here to use a linked list, consider an array to avoid malloc in
+	// the main loop.
+	head = malloc(sizeof (struct link));
+	head->dir = dp_outer;
+	head->next = NULL;
+	head->prev = NULL;
+	head->path_end = strnlen(bpath, PATH_MAX);
+	clink = head;
+	// While the list of our directories isn't empty, iterate through the last DIR* using
+	// readdir.
 	while (clink != NULL) {
-		// Iterate through entries at this depth.
+		// Iterate through entries at this depth. If we encounter a directory then
+		// that directory is appended to our list and clink is set to point to it.
+		// Else call back into fn appropriately.
 		errno = 0;
 		while((dirent = readdir(clink->dir)) != NULL) {
-			puts("startloop");
-			// Skip .. and .
+			// Skip .. and . to avoid an infinite loop. 
+			// As an improvement, consider sym link loops!?
 			if (strncmp(dirent->d_name, "..", 3) == 0 
 				|| strncmp(dirent->d_name, ".", 2) == 0) {
 				continue;
 			}
-			puts(bpath);
+			// Set up the fpath to contain the full path of the current file
 			fpath_len = clink->path_end + strnlen(dirent->d_name, PATH_MAX) + 1;
 			strncpy(fpath, bpath, clink->path_end);
 			strncpy(fpath + clink->path_end + 1, dirent->d_name, PATH_MAX);
 			fpath[clink->path_end] = '/';
 			fpath[PATH_MAX - 1] = '\0';
-			puts(fpath);
-			puts(dirent->d_name);
-			ftwb.level = level;
+			// ftwb.base is set to the length of the directory the item is in
+			// i.e. /path/to/file -> 9
 			ftwb.base = clink->path_end;
-			if (stat(fpath, &sb) == -1) {
+			if (statfn(fpath, &sb) == -1) {
 				// FTW_NS.
 				fn(fpath, &sb, FTW_NS, &ftwb);
 			} else if ((sb.st_mode & S_IFMT) == S_IFDIR) {
 				// FTW_D or FTW_DNR or FTW_DP
-				printf("now opening %s\n", fpath);
 				if ((dp = opendir(fpath)) == NULL) {
 					// FTW_DNR
 					fn(fpath, &sb, FTW_DNR, &ftwb);
 				} else {
-					// FTW_D or FTW_DP
-					// TODO: - tweak behaviour on FTW_DEPTH
-					puts("DIR");
-					fn(fpath, &sb, FTW_D, &ftwb);
+					// FTW_DP is handled outside of this while
+					// (dirent.. ) loop As it leaves the loop having 
+					// read all the files at deeper levels.
+					// Only if FTW_DEPTH is specified. Else treat inline
+					// with other files.
+					if (!(flags & FTW_DEPTH)) {
+						fn(fpath, &sb, FTW_D, &ftwb);
+					}
+					// Set up a new item in the list and set it as the 
+					// current item/link to be readdir'd over 
 					struct link *link = malloc(sizeof (struct link));
 					clink->next = link;
 					link->prev = clink;
 					link->next = NULL;
 					link->dir = dp;
 					link->path_end = strnlen(fpath, PATH_MAX);
+					// clink is updated, so when we continue the loop,
+					// this updated dir will be iterated over.
 					clink = link;
 					strncpy(bpath, fpath, PATH_MAX);
-					level += 1;
-					continue;
+					// Keep ftwb.level up to date. It's now one deeper.
+					ftwb.level++;
 				}
 			} else if ((sb.st_mode & S_IFMT) == S_IFLNK) {
-				// FTW_SL or FTW_SLN IF FTW_PHYS!
+				// FTW_SL or FTW_SLN
+				// Just stat the link to check if it's dangling.
+				if (stat(fpath, &sb_linkcheck) == -1) {
+					fn(fpath, &sb, FTW_SLN, &ftwb);
+				} else {
+					fn(fpath, &sb, FTW_SL, &ftwb);
+				}
 			} else {
 				// FTW_F
 				fn(fpath, &sb, FTW_F, &ftwb);
 			}
 		}
+		// If errno was set by readdir above something went wrong.
 		if (errno != 0) {
 			return -1;
 		}
-		// TODO: - maxfd management?
+		// Everything at this deeper level has been iterated over, so we move back 
+		// up a level.
+		ftwb.level--;
+		// If FTW_DEPTH is set, then we skipped fn for this file above, so we now go
+		// and call fn for it. Have to stat it again, as sb won't be set for this
+		// file.
+		if (flags & FTW_DEPTH) {
+			bpath[ftwb.base] = '\0';
+			if (statfn(bpath, &sb) == -1) {
+				fn(bpath, &sb, FTW_NS, &ftwb);
+			} else {
+				fn(bpath, &sb, FTW_DP, &ftwb);
+			}
+		}
+		// As we've finished iterating through this dir and all deeper, close it and
+		// free the list item.
 		closedir(clink->dir);
 		clink = clink->prev;
-		// Will free head? malloc head too.
-		free(clink->next);
-		clink->next = NULL;
+		if (clink != NULL) {
+			free(clink->next);
+			clink->next = NULL;
+		}
+		// If clink is NULL here, we're at the topmost level and have finished.
 	}
-	
-	// TODO: - Free list
 	return 0;
 }
 
@@ -148,12 +194,35 @@ void error(char *reason) {
 }
 
 int fn(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
+	puts("==========================================");
+	for (int i = -1; i < ftwbuf->level; i++) {
+		printf("*");
+	}
+	printf("\n");
 	puts(fpath);
+	switch (typeflag) {
+		case FTW_F:
+			puts("File");
+			break;
+		case FTW_D:
+			puts("Dir");
+			break;
+		case FTW_DP:
+			puts("Dir (Depth)");
+			break;
+		case FTW_SL:
+			puts("Symlink");
+			break;
+		case FTW_SLN:
+			puts("Symlink (Dangling)");
+			break;
+	}
+	puts("==========================================");
 }
 
 int main(int argc, char **argv) {
 	if (argc < 2)
 		error("usage: nftw <pathname>");
-	nftw(argv[1], fn, 20, 0);
+	nftw(argv[1], fn, 20, FTW_DEPTH | FTW_PHYS);
 	exit(EXIT_SUCCESS);
 }
