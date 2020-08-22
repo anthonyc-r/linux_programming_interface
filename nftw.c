@@ -11,7 +11,7 @@ An implementation of nftw.
 #include <errno.h>
 #include <limits.h>
 
-// TODO: - Handle CHDIR, ACTIONRETVAL & MOUNT
+// TODO: - Handle ACTIONRETVAL
 #define FTW_ACTIONRETVAL 0
 #define FTW_CHDIR 1
 #define FTW_DEPTH 2
@@ -22,7 +22,7 @@ struct link {
 	DIR *dir;
 	int path_end;
 	struct link *prev;
-	struct link *next;	
+	struct link *next;
 };
 
 struct FTW {
@@ -51,7 +51,7 @@ enum FTW_ACTION_RET {
 
 // TODO: - Respect noopenfd value
 int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf), int noopenfd, int flags) {
-	int fpath_len, statcode;
+	int fpath_len, statcode, chdir_fd;
 	// silence warning, bpath+d_name wont be > PATH_MAX.
 	char fpath[PATH_MAX + 256], bpath[PATH_MAX];
 	struct stat sb, sb_linkcheck;
@@ -59,6 +59,7 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 	DIR *dp_outer, *dp;
 	struct dirent *dirent;
 	struct link *head, *clink;
+	dev_t dev;
 	int (*statfn) (const char *pathname, struct stat *statbuf);
 	
 	// We use lstat instead of stat if FTW_PHYS is specified to enable the 
@@ -68,6 +69,13 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 		statfn = lstat;
 	} else {
 		statfn = stat;
+	}
+	// If FTW_MOUNT, save the starting device ID so we can make sure we don't cross
+	// to another mounted filesystem.
+	if (flags & FTW_MOUNT) {
+		if (stat(dirpath, &sb) == -1)
+			return -1;
+		dev = sb.st_dev;
 	}
 	
 	// Set up data for current depth
@@ -128,6 +136,21 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 					if (!(flags & FTW_DEPTH)) {
 						fn(fpath, &sb, FTW_D, &ftwb);
 					}
+					// If it's ino is 1, then it's the root of a new fs
+					// if FTW_MOUNT is set we don't want to cross over
+					// to this new file system!
+					if (flags & FTW_MOUNT && sb.st_dev != dev) {
+						// Since we're done with any processing in
+						// this directory.
+						if (flags & FTW_DEPTH) {
+							fn(fpath, &sb, FTW_DP, &ftwb);
+						}
+						continue;
+					}
+					// chdir into it if need to
+					if (flags & FTW_CHDIR) {
+						chdir(fpath);
+					}
 					// Set up a new item in the list and set it as the 
 					// current item/link to be readdir'd over 
 					struct link *link = malloc(sizeof (struct link));
@@ -155,6 +178,8 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 				// FTW_F
 				fn(fpath, &sb, FTW_F, &ftwb);
 			}
+			// Reset errno in case it was set above (dangling link stat)
+			errno = 0;
 		}
 		// If errno was set by readdir above something went wrong.
 		if (errno != 0) {
@@ -163,9 +188,29 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 		// Everything at this deeper level has been iterated over, so we move back 
 		// up a level.
 		ftwb.level--;
+		// As we've finished iterating through this dir and all deeper, close it and
+		// free the list item.
+		closedir(clink->dir);
+		clink = clink->prev;
+		if (clink != NULL) {
+			free(clink->next);
+			clink->next = NULL;
+		} 
+		// If clink is NULL here, we're at the topmost level and have finished.
+		
 		// If FTW_DEPTH is set, then we skipped fn for this file above, so we now go
 		// and call fn for it. Have to stat it again, as sb won't be set for this
 		// file.
+		// First update our cwd if ness... 
+		if (clink == NULL) {
+			if (chdir(dirpath) == -1 || chdir("..") == -1)
+				return -1;
+		} else {
+			if ((chdir_fd = dirfd(clink->dir)) == -1)
+				return -1;
+			if (fchdir(chdir_fd) == -1)
+				return -1;
+		}
 		if (flags & FTW_DEPTH) {
 			bpath[ftwb.base] = '\0';
 			if (statfn(bpath, &sb) == -1) {
@@ -174,15 +219,6 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 				fn(bpath, &sb, FTW_DP, &ftwb);
 			}
 		}
-		// As we've finished iterating through this dir and all deeper, close it and
-		// free the list item.
-		closedir(clink->dir);
-		clink = clink->prev;
-		if (clink != NULL) {
-			free(clink->next);
-			clink->next = NULL;
-		}
-		// If clink is NULL here, we're at the topmost level and have finished.
 	}
 	return 0;
 }
@@ -194,12 +230,14 @@ void error(char *reason) {
 }
 
 int fn(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
+	char buf[PATH_MAX];
 	puts("==========================================");
 	for (int i = -1; i < ftwbuf->level; i++) {
 		printf("*");
 	}
 	printf("\n");
-	puts(fpath);
+	printf("(%s)\n", fpath);
+	printf("[%s]\n", getcwd(buf, PATH_MAX));
 	switch (typeflag) {
 		case FTW_F:
 			puts("File");
@@ -223,6 +261,7 @@ int fn(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbu
 int main(int argc, char **argv) {
 	if (argc < 2)
 		error("usage: nftw <pathname>");
-	nftw(argv[1], fn, 20, FTW_DEPTH | FTW_PHYS);
+	if (nftw(argv[1], fn, 20, FTW_DEPTH | FTW_PHYS | FTW_CHDIR | FTW_MOUNT) == -1)
+		error("nftw");
 	exit(EXIT_SUCCESS);
 }
