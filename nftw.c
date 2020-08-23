@@ -11,16 +11,16 @@ An implementation of nftw.
 #include <errno.h>
 #include <limits.h>
 
-// TODO: - Handle ACTIONRETVAL
-#define FTW_ACTIONRETVAL 0
-#define FTW_CHDIR 1
-#define FTW_DEPTH 2
-#define FTW_MOUNT 4
-#define FTW_PHYS 8
+#define FTW_ACTIONRETVAL 1
+#define FTW_CHDIR 2
+#define FTW_DEPTH 4
+#define FTW_MOUNT 8
+#define FTW_PHYS 16
 
 struct link {
 	DIR *dir;
 	int path_end;
+	long dir_loc;
 	struct link *prev;
 	struct link *next;
 };
@@ -40,7 +40,6 @@ enum FTW_FTYPE {
 	FTW_SLN
 };
 
-// TODO: - Handle fn returns.
 enum FTW_ACTION_RET {
 	FTW_CONTINUE,
 	FTW_SKIP_SIBLINGS,
@@ -48,17 +47,50 @@ enum FTW_ACTION_RET {
 	FTW_STOP
 };
 
+static void freelist(struct link *head) {
+	struct link *next, *current;
+	next = head;
+	while (next != NULL) {
+		current = next;
+		next = current->next;
+		free(current);
+	}
+}
+
+static DIR *nftw_opendir_path(int depth, int noopenfd, struct link **lclosed, char *path) {
+	struct link *toclose;
+	if (depth > noopenfd) {
+		toclose = (*lclosed)->next;
+		if ((toclose->dir_loc = telldir(toclose->dir)) == -1)
+			return NULL;
+		closedir(toclose->dir);
+		toclose->dir = NULL;	
+		*lclosed = toclose;
+	}
+	return opendir(path);
+}
+static DIR *nftw_reopendir(int depth, int noopenfd, struct link *clink, char *path) {
+	DIR *ret;
+	if (clink->dir != NULL) {
+		ret = clink->dir;
+	} else {
+		ret = opendir(path);
+		seekdir(ret, clink->dir_loc);
+	}
+	return ret;
+} 
+
 
 // TODO: - Respect noopenfd value
 int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf), int noopenfd, int flags) {
-	int fpath_len, statcode, chdir_fd;
+	int fpath_len, statcode, chdir_fd, retval;
 	// silence warning, bpath+d_name wont be > PATH_MAX.
 	char fpath[PATH_MAX + 256], bpath[PATH_MAX];
 	struct stat sb, sb_linkcheck;
 	struct FTW ftwb;
 	DIR *dp_outer, *dp;
 	struct dirent *dirent;
-	struct link *head, *clink;
+	struct link *head, *clink, *lclosed;
 	dev_t dev;
 	int (*statfn) (const char *pathname, struct stat *statbuf);
 	
@@ -77,6 +109,12 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 			return -1;
 		dev = sb.st_dev;
 	}
+	// If FTW_CHDIR, chdir to start..
+	if (flags & FTW_CHDIR) {
+		if (chdir(dirpath) == -1)
+			return -1;
+	}
+	
 	
 	// Set up data for current depth
 	if (realpath(dirpath, bpath) == NULL)
@@ -121,12 +159,12 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 			ftwb.base = clink->path_end;
 			if (statfn(fpath, &sb) == -1) {
 				// FTW_NS.
-				fn(fpath, &sb, FTW_NS, &ftwb);
+				retval = fn(fpath, &sb, FTW_NS, &ftwb);
 			} else if ((sb.st_mode & S_IFMT) == S_IFDIR) {
 				// FTW_D or FTW_DNR or FTW_DP
 				if ((dp = opendir(fpath)) == NULL) {
 					// FTW_DNR
-					fn(fpath, &sb, FTW_DNR, &ftwb);
+					retval = fn(fpath, &sb, FTW_DNR, &ftwb);
 				} else {
 					// FTW_DP is handled outside of this while
 					// (dirent.. ) loop As it leaves the loop having 
@@ -134,18 +172,17 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 					// Only if FTW_DEPTH is specified. Else treat inline
 					// with other files.
 					if (!(flags & FTW_DEPTH)) {
-						fn(fpath, &sb, FTW_D, &ftwb);
+						retval = fn(fpath, &sb, FTW_D, &ftwb);
 					}
-					// If it's ino is 1, then it's the root of a new fs
-					// if FTW_MOUNT is set we don't want to cross over
-					// to this new file system!
+					// If changed dev and FTW_MOUNT, don't iter through
+					// that dir to avoid crossing mount points.
 					if (flags & FTW_MOUNT && sb.st_dev != dev) {
 						// Since we're done with any processing in
 						// this directory.
 						if (flags & FTW_DEPTH) {
-							fn(fpath, &sb, FTW_DP, &ftwb);
+							retval = fn(fpath, &sb, FTW_DP, &ftwb);
 						}
-						continue;
+						goto handle_actionret_and_continue;
 					}
 					// chdir into it if need to
 					if (flags & FTW_CHDIR) {
@@ -158,6 +195,7 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 					link->prev = clink;
 					link->next = NULL;
 					link->dir = dp;
+					link->dir_loc = -1;
 					link->path_end = strnlen(fpath, PATH_MAX);
 					// clink is updated, so when we continue the loop,
 					// this updated dir will be iterated over.
@@ -170,21 +208,44 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 				// FTW_SL or FTW_SLN
 				// Just stat the link to check if it's dangling.
 				if (stat(fpath, &sb_linkcheck) == -1) {
-					fn(fpath, &sb, FTW_SLN, &ftwb);
+					retval = fn(fpath, &sb, FTW_SLN, &ftwb);
 				} else {
-					fn(fpath, &sb, FTW_SL, &ftwb);
+					retval = fn(fpath, &sb, FTW_SL, &ftwb);
 				}
 			} else {
 				// FTW_F
-				fn(fpath, &sb, FTW_F, &ftwb);
+				retval = fn(fpath, &sb, FTW_F, &ftwb);
 			}
 			// Reset errno in case it was set above (dangling link stat)
 			errno = 0;
+handle_actionret_and_continue:
+			// If FTW_ACTIONRETVAL handle the retval.
+			if (flags & FTW_ACTIONRETVAL) {
+				switch (retval) {
+					// Fastforward DIR* to skip siblings. Effectively the
+					// same thing at the end of the above loop.
+					// Assuming fn doesn't mis-return SKIP_SUBTREE.
+					case FTW_SKIP_SIBLINGS:
+					case FTW_SKIP_SUBTREE:
+						goto finished_current_level;
+					case FTW_STOP:
+						// Return early. Will have items in the list.
+						freelist(head);
+						return 0;
+					case FTW_CONTINUE:
+						// Continue as normal.
+						break;
+					default:
+						// Treat any other values as FTW_CONTINUE.
+						break;
+				}
+			}
 		}
 		// If errno was set by readdir above something went wrong.
 		if (errno != 0) {
 			return -1;
 		}
+finished_current_level:
 		// Everything at this deeper level has been iterated over, so we move back 
 		// up a level.
 		ftwb.level--;
@@ -256,12 +317,21 @@ int fn(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbu
 			break;
 	}
 	puts("==========================================");
+	if (ftwbuf->level > 0 && typeflag == FTW_D) {
+		puts("Skip Subtree...");
+		return FTW_SKIP_SUBTREE;
+	} else if (typeflag == FTW_SLN) {
+		puts("Stop!");
+		return FTW_STOP;
+	}
+	return FTW_CONTINUE;
 }
 
 int main(int argc, char **argv) {
 	if (argc < 2)
 		error("usage: nftw <pathname>");
-	if (nftw(argv[1], fn, 20, FTW_DEPTH | FTW_PHYS | FTW_CHDIR | FTW_MOUNT) == -1)
+	if (nftw(argv[1], fn, 20,  FTW_PHYS | FTW_CHDIR | FTW_MOUNT 
+		| FTW_ACTIONRETVAL) == -1)
 		error("nftw");
 	exit(EXIT_SUCCESS);
 }
