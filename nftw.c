@@ -57,7 +57,7 @@ static void freelist(struct link *head) {
 	}
 }
 
-static DIR *nftw_opendir_path(int depth, int noopenfd, struct link **lclosed, char *path) {
+static DIR *nftw_opendir(int depth, int noopenfd, struct link **lclosed, char *path) {
 	struct link *toclose;
 	if (depth > noopenfd) {
 		toclose = (*lclosed)->next;
@@ -69,19 +69,16 @@ static DIR *nftw_opendir_path(int depth, int noopenfd, struct link **lclosed, ch
 	}
 	return opendir(path);
 }
-static DIR *nftw_reopendir(int depth, int noopenfd, struct link *clink, char *path) {
+static void nftw_reopendir(struct link *clink, struct link **lclosed, char *path) {
 	DIR *ret;
-	if (clink->dir != NULL) {
-		ret = clink->dir;
-	} else {
-		ret = opendir(path);
-		seekdir(ret, clink->dir_loc);
+	if (clink->dir == NULL) {
+		clink->dir = opendir(path);
+		seekdir(clink->dir, clink->dir_loc);
+		*lclosed = clink->prev;
 	}
-	return ret;
 } 
 
 
-// TODO: - Respect noopenfd value
 int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf), int noopenfd, int flags) {
 	int fpath_len, statcode, chdir_fd, retval;
 	// silence warning, bpath+d_name wont be > PATH_MAX.
@@ -134,6 +131,7 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 	head->prev = NULL;
 	head->path_end = strnlen(bpath, PATH_MAX);
 	clink = head;
+	lclosed = head;
 	// While the list of our directories isn't empty, iterate through the last DIR* using
 	// readdir.
 	while (clink != NULL) {
@@ -162,7 +160,8 @@ int nftw(const char *dirpath, int (*fn) (const char *fpath, const struct stat *s
 				retval = fn(fpath, &sb, FTW_NS, &ftwb);
 			} else if ((sb.st_mode & S_IFMT) == S_IFDIR) {
 				// FTW_D or FTW_DNR or FTW_DP
-				if ((dp = opendir(fpath)) == NULL) {
+				dp = nftw_opendir(ftwb.level + 1, noopenfd, &lclosed, fpath);
+				if (dp == NULL) {
 					// FTW_DNR
 					retval = fn(fpath, &sb, FTW_DNR, &ftwb);
 				} else {
@@ -256,6 +255,10 @@ finished_current_level:
 		if (clink != NULL) {
 			free(clink->next);
 			clink->next = NULL;
+			// Reopen it if ness. It's fine to use fpath and bpath like this as after moving up
+			// a level, everything beyond where we null won't be used again.
+			fpath[clink->path_end] = '\0';
+			nftw_reopendir(clink, &lclosed, fpath);
 		} 
 		// If clink is NULL here, we're at the topmost level and have finished.
 		
@@ -263,14 +266,16 @@ finished_current_level:
 		// and call fn for it. Have to stat it again, as sb won't be set for this
 		// file.
 		// First update our cwd if ness... 
-		if (clink == NULL) {
-			if (chdir(dirpath) == -1 || chdir("..") == -1)
-				return -1;
-		} else {
-			if ((chdir_fd = dirfd(clink->dir)) == -1)
-				return -1;
-			if (fchdir(chdir_fd) == -1)
-				return -1;
+		if (flags & FTW_CHDIR) {
+			if (clink == NULL) {
+				if (chdir(dirpath) == -1 || chdir("..") == -1)
+					return -1;
+			} else {
+				if ((chdir_fd = dirfd(clink->dir)) == -1)
+					return -1;
+				if (fchdir(chdir_fd) == -1)
+					return -1;
+			}
 		}
 		if (flags & FTW_DEPTH) {
 			bpath[ftwb.base] = '\0';
@@ -317,6 +322,7 @@ int fn(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbu
 			break;
 	}
 	puts("==========================================");
+	return FTW_CONTINUE;
 	if (ftwbuf->level > 0 && typeflag == FTW_D) {
 		puts("Skip Subtree...");
 		return FTW_SKIP_SUBTREE;
