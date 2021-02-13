@@ -12,7 +12,7 @@ struct num_open_req {
 };
 
 struct num_response {
-	int nreq;
+	int nres;
 	int nums[];
 };
 
