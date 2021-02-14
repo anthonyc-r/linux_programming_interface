@@ -33,7 +33,6 @@ int main(int argc, char **argv) {
 	sfd = open(FIFO_SERVER, O_WRONLY);
 	if (write(sfd, &req, sizeof (struct num_open_req)) == -1)
 		exit_err("write - num_server probably isn't running.");
-
 	// Now the server should proceed to open our fifo for writing.
 	mfd = open(mpath, O_RDONLY);
 	if ((read(mfd, &res_sz, sizeof (int))) == -1)

@@ -15,10 +15,13 @@
 #include <string.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #define REQ_SZ sizeof (struct num_open_req)
 #define BAK_FILE "/tmp/num_server.bak"
 #define FILE_PERMS S_IWUSR | S_IRUSR | S_IWOTH | S_IROTH
+
+static volatile sig_atomic_t timeout;
 
 static void exit_err(char *reason) {
 	printf("%s (%s)\n", reason, strerror(errno));
@@ -70,6 +73,22 @@ static void update_backup(int fd, int seq_start) {
 		exit_err("write backup");
 }
 
+void handler(int sig) {
+	switch (sig) {
+	case SIGTERM:
+	case SIGINT:
+		unlink(FIFO_SERVER);
+		exit(EXIT_SUCCESS);
+	case SIGALRM:
+		timeout = 1;
+		// Not safe to use stdio but...
+		puts("timeout");
+		break;
+	default:
+		break;
+	}
+}
+
 int main(int argc, char **argv) {
 	int n, i;
 	int sfifo, cfifo, sfifo_write, bak;
@@ -77,6 +96,17 @@ int main(int argc, char **argv) {
 	ssize_t nread, res_sz;
 	struct num_open_req req;
 	struct num_response *res;
+	struct sigaction sigact;
+	
+	sigact.sa_handler = handler;
+	if (sigemptyset(&sigact.sa_mask) == -1)
+		exit_err("sigemptyset");
+	if (sigaction(SIGINT, &sigact, NULL) == -1)
+		exit_err("sigaction 1");
+	if (sigaction(SIGTERM, &sigact, NULL) == -1)
+		exit_err("sigaction 2");
+	if (sigaction(SIGALRM, &sigact, NULL) == -1)
+		exit_err("sigaction 3");
 
 	bak = load_backup(&n);
 	
@@ -102,12 +132,42 @@ int main(int argc, char **argv) {
 		}
 		if (snprintf(cpath, PATH_MAX, FIFO_CLIENT_TEMPLATE, (long long)req.pid) < 0)
 			exit_err("snprintf");
-		if ((cfifo = open(cpath, O_WRONLY)) == -1)
-			exit_err("open 3");
-		if (write(cfifo, &res_sz, sizeof (int)) != sizeof  (int))
-			exit_err("write 1");
-		if (write(cfifo, res, res_sz) != res_sz)
-			exit_err("write 2");
+
+		// Allow the client 1 second to open it's FIFO, to avoid DOS attacks.
+		alarm(1);
+		errno = 0;
+		if ((cfifo = open(cpath, O_WRONLY)) == -1) {
+			// Client hasn't opened it's end of the FIFO!!
+			if (errno == EINTR && timeout) {
+				timeout = 0;
+				puts("Misbehaved client, skipping");
+				continue;
+			} else {
+				// Unexpected error.
+				exit_err("open 3");
+			}
+		}
+		alarm(0);
+
+		// Possibility that a misbehaved client has closed it's end of the FIFO. Handle EPIPE
+		errno = 0;
+		if (write(cfifo, &res_sz, sizeof (int)) != sizeof  (int)) {
+			if (errno == EPIPE) {
+				puts("Misbehaved client, skipping");
+				continue;
+			} else {
+				exit_err("write 1");
+			}
+		}
+		errno = 0;
+		if (write(cfifo, res, res_sz) != res_sz) {
+			if (errno == EPIPE) {
+				puts("Misbehaved client, skipping");
+				continue;
+			} else {
+				exit_err("write 2");
+			}
+		}
 		free(res);
 		if (close(cfifo) == -1)
 			exit_err("close 1");
@@ -119,7 +179,6 @@ int main(int argc, char **argv) {
 	close(bak);
 	close(sfifo_write);
 	close(sfifo);
-	unlink(FIFO_CLIENT_TEMPLATE);
-	puts("fifo EOF");
+	unlink(FIFO_SERVER);
 	exit(EXIT_SUCCESS);
 }
