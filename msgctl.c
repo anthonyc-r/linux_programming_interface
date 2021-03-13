@@ -12,10 +12,12 @@
 #include <sys/msg.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <limits.h>
 
 struct msg {
-	int type;
-	char text[];
+	long type;
+	char text[1];
 };
 
 static void exit_usage() {
@@ -27,7 +29,7 @@ static void exit_usage() {
 }
 
 static void exit_error(char *reason) {
-	printf("%s - %s\n", reason, strerror(errno));
+	printf("%s - (%d)%s\n", reason, errno, strerror(errno));
 	exit(EXIT_FAILURE);
 }
 
@@ -64,18 +66,43 @@ static void send(int num, int argc, char **argv) {
 	id = (int)strtol(argv[0], &ep, 10);
 	if (*ep != '\0')
 		exit_usage();
-	
-	len = strlen(argv[1]);
+	if (num == 0)
+		num++;
+		
+	len = strlen(argv[1]) + 1;
 	if ((msg = malloc(sizeof(struct msg) + len)) == NULL)
 		exit_error("malloc");
+		
 	msg->type = num;
 	strncpy(msg->text, argv[1], len);
-	if (msgsnd(id, &msg, sizeof(struct msg) + len, 0) == -1)
+	if (msgsnd(id, msg, len, 0) == -1)
 		exit_error("msgsnd");
 }
 
 static void receive(int num, int argc, char **argv) {
+	int id;
+	char *ep;
+	size_t len;
+	struct msg *msg;
+	struct msqid_ds msqbuf;
 
+	if (argc != 1)
+		exit_usage();
+	id = (int)strtol(argv[0], &ep, 10);
+	if (*ep != '\0')
+		exit_usage();
+
+	if (msgctl(id, IPC_STAT, &msqbuf) == -1)
+		exit_error("msgctl");
+	
+	msg = calloc(1, msqbuf.msg_qbytes + sizeof(struct msg));
+	if (msg == NULL)
+		exit_error("malloc");
+	if (msgrcv(id, msg, msqbuf.msg_qbytes, num, IPC_NOWAIT) == -1)
+		exit_error("msgrcv");
+	
+	msg->text[msqbuf.msg_qbytes - 1] = '\0';
+	printf("%s\n", msg->text);
 }
 
 int main(int argc, char **argv) {
