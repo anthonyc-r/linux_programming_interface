@@ -9,35 +9,76 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <signal.h>
+#include <syslog.h>
 
 #include "server.h"
 
 static int id;
 
 static void exit_err(char *reason) {
-	printf("%s - %s\n", reason, strerror(errno));
+	syslog(LOG_ERR, "%s - %s\n", reason, strerror(errno));
 	exit(EXIT_FAILURE);
 }
 
+static void daemonize() {
+	switch (fork()) {
+	case -1:
+		exit_err("fork1");
+	case 0:
+		if (setsid() == -1)
+			exit_err("setsid");
+		switch (fork()) {
+		case -1:
+			exit_err("fork2");
+		case 0:
+			break;
+		default:
+			exit(EXIT_SUCCESS);
+		}
+		
+		break;
+	default:
+		exit(EXIT_SUCCESS);
+	}
+	if (umask(0) == -1)
+		exit_err("umask");
+	if (chdir("/") == -1)
+		exit_err("chdir");
+	close(0);
+	if (open("/dev/null", O_RDWR) != 0)
+		exit_err("closed 0 & open != 0");
+	if (dup2(0, 1) == -1)
+		exit_err("dup2 1");
+	if (dup2(0, 2) == -1)
+		exit_err("dup2 2");
+	syslog(LOG_DEBUG, "Became daemon.");
+}
+
 static void sig(int s) {
-	exit(EXIT_SUCCESS);
+	syslog(LOG_INFO, "Shutting Down - Removing ID");
+	unlink(ID_FILE);
+	msgctl(id, IPC_RMID, 0);
+	closelog();
+	signal(s, SIG_DFL);
+	raise(s);
+	syslog(LOG_ERR, "Failed to stop by re-raising sig %d", s);
+	exit(EXIT_FAILURE);
 }
 
 static void setup_sig() {
 	struct sigaction sigact;
 	sigact.sa_mask = 0;
-	sigact.sa_flags = 0;
+	sigact.sa_flags = SA_NODEFER;
 	sigact.sa_handler = sig;
 	
+	errno = 0;
 	sigaction(SIGINT, &sigact, NULL);
+	sigaction(SIGTERM, &sigact, NULL);
 	sigaction(SIGQUIT, &sigact, NULL);
+	signal(SIGCHLD, SIG_IGN);
 	
-}
-
-static void remove_id() {
-	puts("Removing ID");
-	unlink(ID_FILE);
-	msgctl(id, IPC_RMID, 0);
+	if (errno != 0)
+		exit_err("signal handlers");
 }
 
 static void create_id() {
@@ -69,9 +110,12 @@ static void handle_request(struct file_request *req) {
 	ssize_t n;
 	struct file_part part;
 	
+	syslog(LOG_INFO, "Serving request for file %s", req->path);
 	if ((fd = open(req->path, O_RDONLY)) == -1) {
+		syslog(LOG_INFO, "Client requested path we can't open");
 		res = MSG_OPEN_ERROR;
-		msgsnd(req->qid, &res, 0, 0);
+		if (msgsnd(req->qid, &res, 0, 0) == -1)
+			syslog(LOG_INFO, "Failed to send MSG_OPEN_ERROR to client");
 		return;
 	}
 	
@@ -83,25 +127,39 @@ static void handle_request(struct file_request *req) {
 			break;
 	}
 	if (errno != 0) {
-		printf("Failed to read file at %s (%s)\n", req->path,
+		syslog(LOG_INFO, "Failed to read file at %s (%s)\n", req->path,
 			strerror(errno));
 		res = MSG_READ_ERROR;
-		msgsnd(req->qid, &res, 0, 0);
+		if (msgsnd(req->qid, &res, 0, 0) == -1)
+			syslog(LOG_INFO, "Failed to send MSG_READ_ERROR to client");
 		return;
 	} else {
 		res = MSG_DONE;
-		msgsnd(req->qid, &res, 0, 0);
+		if (msgsnd(req->qid, &res, 0, 0) == -1)
+			syslog(LOG_INFO, "Failed to send MSG_DONE to client");
 	}
 }
 
 int main(int argc, char **argv) {
 	struct file_request req;
+	int waitr;
 	
+	daemonize();
+	openlog("file_server", LOG_PID | LOG_PERROR, LOG_DAEMON);
+	syslog(LOG_INFO, "Started");
 	setup_sig();
-	atexit(remove_id);
 	create_id();
 	while (get_request(&req) != -1) {
-		handle_request(&req);
+		switch (fork()) {
+		case -1:
+			exit_err("fork!");
+		case 0:
+			handle_request(&req);
+			// Don't call atexit etc.
+			exit(EXIT_SUCCESS);
+		default:
+			break;
+		}
 	}
 	exit_err("get_request");
 }
