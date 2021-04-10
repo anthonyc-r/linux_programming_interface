@@ -105,10 +105,17 @@ static void sem_list() {
 	
 	arg.buf = &buf;
 	// TODO: - Upper bound?
+	printf("ID\tPERM\tCOUNT\tOTIME\t\tCTIME\n");
 	for (i = 0; i < 1000000; i++) {
-		if (semctl(i, 0, IPC_STAT, arg) != -1)
+		if (semctl(i, 0, IPC_STAT, arg) != -1) {
 			// TODO: - Detailed info.
-			printf("%08x\n", i);
+			printf("%d\t", i);
+			printf("%04o\t", buf.sem_perm.mode);
+			printf("%d\t", buf.sem_nsems);
+			printf("%lld\t", buf.sem_otime);
+			printf("%lld\t", buf.sem_ctime);
+			puts("");
+		}
 	}
 }
 
