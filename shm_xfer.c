@@ -59,13 +59,26 @@ static void receive() {
 		exit_err("shmat");
 	// Tell the server we're ready!
 	sop.sem_num = 0;
-	sop.sem_op = 1;
+	sop.sem_op = 0;
 	sop.sem_flg = 0;
+	// Wait for server to indicate we can read...
 	if (semop(semid, &sop, 1) == -1)
 		exit_err("semop ready");
-	while ((lastn = xbuf->n) > 0) {
+	while (1) {
+		if ((lastn = xbuf->n) < 1) {
+			puts("Done");
+			break;
+		}
 		if (write(STDOUT_FILENO, &xbuf->buf, xbuf->n) != xbuf->n)
 			exit_err("write stdout");
+		// Tell server we've read..
+		sop.sem_op = 2;
+		if (semop(semid, &sop, 1) == -1)
+			exit_err("semop indicate read");
+		// Wait for read...
+		sop.sem_op = 0;
+		if (semop(semid, &sop, 1) == -1)
+			exit_err("semop wait for read");
 	}
 	
 	shmdt(xbuf);
@@ -95,11 +108,11 @@ static void send() {
 		exit_err("semget");
 	
 	// Init the semaphore at 0./
-	semarg.val = 0;
-	if (semctl(semid, 0, IPC_SET, semarg) == -1)
+	semarg.val = 1;
+	if (semctl(semid, 0, SETVAL, semarg) == -1)
 		exit_err("semctl init");
 	
-	if ((fd = open(SHM_FILE, O_CREAT | O_WRONLY | S_IWUSR | S_IRUSR)) == -1)
+	if ((fd = open(SHM_FILE, O_CREAT | O_WRONLY, S_IWUSR | S_IRUSR)) == -1)
 		exit_err("open SHM_FILE");
 	if (write(fd, &shmid, sizeof (int)) != sizeof (int))
 		exit_err("write shmid SHM_FILE");
@@ -114,17 +127,21 @@ static void send() {
 	// ...
 	puts("wait for client..");
 	sop.sem_num = 0;
-	sop.sem_op = -1;
+	sop.sem_op = 1;
 	sop.sem_flg = 0;
-	if (semop(semid, &sop, 1) == -1)
-		exit_err("semop wait for client");
-	
-	puts("client ready");
 	
 	unlink(SHM_FILE);
-	while ((nread = read(STDIN_FILENO, buf, BLOCK_SZ)) > 0) {
+	while ((nread = read(STDIN_FILENO, buf, BLOCK_SZ)) > 0)  {
+		puts("writing to xbuf");
 		xbuf->n = nread;
 		memcpy(xbuf->buf, buf, nread);
+		// Tell client it may read.
+		sop.sem_op = -1;
+		if (semop(semid, &sop, 1) == -1)
+			exit_err("semop wait for client...");
+		// Wait for client to have read...
+		if (semop(semid, &sop, 1) == -1)
+			exit_err("semop wait to write...");
 	}
 	if (nread == -1) {
 		xbuf->n = -1;
