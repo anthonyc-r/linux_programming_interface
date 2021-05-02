@@ -27,6 +27,10 @@ static void exit_err(char *reason) {
 	exit(EXIT_FAILURE);
 }
 
+static void log(char *msg) {
+	puts(msg);
+}
+
 static void receive() {
 	struct stat sb;
 	int shmid, semid, fd, lastn;
@@ -57,31 +61,41 @@ static void receive() {
 		exit_err("close SHM_FILE");
 	if ((xbuf = shmat(shmid, 0, 0)) == NULL)
 		exit_err("shmat");
-	// Tell the server we're ready!
 	sop.sem_num = 0;
-	sop.sem_op = 0;
+	sop.sem_op = -1;
 	sop.sem_flg = 0;
-	// Wait for server to indicate we can read...
+	log("Tell server client is ready");
 	if (semop(semid, &sop, 1) == -1)
 		exit_err("semop ready");
+		
+		
 	while (1) {
+		log("Take 1, client is reading");
+		sop.sem_op = -1;
+		if (semop(semid, &sop, 1) == -1)
+			exit_err("semop wait for read");
+		
+		sleep(1);
 		if ((lastn = xbuf->n) < 1) {
-			puts("Done");
-			break;
+			log("xbuf->n < 1. Take 1, client finished reading");
+			if (semop(semid, &sop, 1) == -1)
+				exit_err("semop indicate read");
+				break;
 		}
 		if (write(STDOUT_FILENO, &xbuf->buf, xbuf->n) != xbuf->n)
 			exit_err("write stdout");
-		// Tell server we've read..
-		sop.sem_op = 2;
+			
+		log("Take 1, client finished reading");
 		if (semop(semid, &sop, 1) == -1)
 			exit_err("semop indicate read");
-		// Wait for read...
-		sop.sem_op = 0;
-		if (semop(semid, &sop, 1) == -1)
-			exit_err("semop wait for read");
 	}
-	
+	log("xbuf->n < 1. Detatch.");
+	sleep(1);	
 	shmdt(xbuf);
+	log("Tell server we've cleaned up");
+	sop.sem_op = 1;
+	if (semop(semid, &sop, 1) == -1)
+		exit_err("semop cleaned up");
 	if (lastn != 0)
 		exit_err("Non 0 final status");
 }
@@ -123,32 +137,51 @@ static void send() {
 	if ((xbuf = shmat(shmid, 0, 0)) == NULL)
 		exit_err("shmat");
 	
-	// Wait for client to setup
-	// ...
-	puts("wait for client..");
+
+	log("Waiting for a client..");
 	sop.sem_num = 0;
-	sop.sem_op = 1;
+	sop.sem_op = 0;
 	sop.sem_flg = 0;
+	if (semop(semid, &sop, 1) == -1)
+		exit_err("semop wait for client to begin");
 	
 	unlink(SHM_FILE);
 	while ((nread = read(STDIN_FILENO, buf, BLOCK_SZ)) > 0)  {
-		puts("writing to xbuf");
+		sleep(1);
+		log("Writing to shared memory");
 		xbuf->n = nread;
 		memcpy(xbuf->buf, buf, nread);
-		// Tell client it may read.
-		sop.sem_op = -1;
+		log("Add 2. Tell client it can read");
+		sop.sem_op = 2;
+		// Tell client to read...
 		if (semop(semid, &sop, 1) == -1)
-			exit_err("semop wait for client...");
-		// Wait for client to have read...
+			exit_err("semop tell client to read...");
+		log("Wait for client to finish reading (0).");
+		sop.sem_op = 0;
 		if (semop(semid, &sop, 1) == -1)
 			exit_err("semop wait to write...");
 	}
+	sleep(1);
 	if (nread == -1) {
 		xbuf->n = -1;
 	} else {
 		// Indicate eof.
 		xbuf->n = 0;
 	}
+	log("Tell client it can read (for final time)...");
+	sop.sem_op = 2;
+	if (semop(semid, &sop, 1) == -1)
+		exit_err("semop last read");
+	sop.sem_op = 0;
+	if (semop(semid, &sop, 1) == -1)
+		exit_err("semop wait for last read");
+	sleep(1);
+	log("Wait for client to cleanup");
+	sop.sem_op = 0;
+	if (semop(semid, &sop, 1) == -1)
+		exit_err("semop wait for client cleanup");
+	
+	log("OK. Remove IPC objects");
 	if (shmdt(xbuf))
 		exit_err("shmdt");
 	if (shmctl(shmid, IPC_RMID, NULL) == -1)
