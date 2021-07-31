@@ -21,8 +21,19 @@ static void exit_err(char *reason) {
 	exit(EXIT_FAILURE);
 }
 
-void mreceived(int sig) {
-
+void mreceived(int sig, siginfo_t *info, void *data) {
+	/*
+	Can't actually see any way of getting mqd from info as the book
+	suggests... Only way I can think of getting it without already
+	knowing it is by mounting the message queue filesystem and
+	checking that.
+	*/
+	printf("Siginfo:\n");
+	printf("si_signo: %d\n", info->si_signo);
+	printf("si_pid: %d\n", info->si_pid);
+	printf("si_uid: %d\n", info->si_uid);
+	printf("si_code: %d\n", info->si_code);
+	printf("sival_ptr: %p\n", info->si_value.sival_ptr);
 }
 
 int main(int argc, char **argv) {
@@ -51,9 +62,11 @@ int main(int argc, char **argv) {
 			exit_err("mq_open4");
 	}
 
+	printf("Receiving mq descriptor: %d\n", qrcv);
+
 	sigemptyset(&sigact.sa_mask);
-	sigact.sa_handler = mreceived;
-	sigact.sa_flags = 0;
+	sigact.sa_sigaction = mreceived;
+	sigact.sa_flags = SA_SIGINFO;
 	if (sigaction(SIGUSR1, &sigact, NULL) == -1)
 		exit_err("sigaction");
 
