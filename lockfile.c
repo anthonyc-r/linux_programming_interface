@@ -11,6 +11,8 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <time.h>
 
 #define MAXFILES 100
 #define NO_LOCKTIMEOUT -1
@@ -33,15 +35,22 @@ static long getlong(char *str, char *argnam) {
 }
 
 static int timed_out(struct timespec *ts, int locktimeout) {
+	time_t now;
+
 	if (locktimeout == NO_LOCKTIMEOUT)
 		return 0;
-	return 1;
+	if ((now = time(NULL)) == (time_t) -1)
+		exit_err("time");
+	if ((now - ts->tv_sec) >= locktimeout)
+		return 1;
+	else
+		return 0;
 }
 
 
 int main(int argc, char **argv) {
 	long sleeptime, retries, locktimeout, suspend;
-	int invert, opt, fdv[MAXFILES], i;
+	int invert, opt, fdv[MAXFILES], i, nretries;
 	struct stat sb;
 	
 	sleeptime = 8;
@@ -76,20 +85,33 @@ int main(int argc, char **argv) {
 	argv += optind;
 	argc -= optind;
 
-	printf("retries: %ld, locktimeout: %ld, suspend: %ld, sleeptime: %ld\n",
-		retries, locktimeout, suspend, sleeptime);
-	printf("invert?: %d\n", invert);
-
 	if (argc > MAXFILES)
 		exit_err("Too many files");
+	nretries = 0;
 	for (i = 0; i < argc; i++) {
 		if (stat(argv[i], &sb) != -1 && timed_out(&sb.st_mtim, locktimeout)) {
 			if (unlink(argv[i]) == -1)
 				exit_err("unlink timed out lockfile");
+			sleep(suspend);
 		}
 		fdv[i] = open(argv[i], O_CREAT | O_EXCL, S_IRUSR | S_IROTH | S_IRGRP);
-
+		if (fdv[i] == -1) {
+			if (errno != EEXIST)
+				exit_err("open");
+			if (retries == -1 || nretries < retries) {
+				nretries++;
+				i--;
+				sleep(sleeptime);
+			} else {
+				if (invert)
+					exit(EXIT_SUCCESS);
+				else
+					exit(EXIT_FAILURE);
+			}
+		}
 	}
-
-	exit(EXIT_SUCCESS);
+	if (invert)
+		exit(EXIT_FAILURE);
+	else
+		exit(EXIT_SUCCESS);
 }
