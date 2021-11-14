@@ -67,6 +67,7 @@ char *readLineBuf(struct rlbuf *rlbuf) {
 
 }
 
+#ifdef TEST
 int main(int argc, char **argv) {
 	struct rlbuf rlbuf;
 	int fd;
@@ -79,4 +80,5 @@ int main(int argc, char **argv) {
 	puts("EOF");
 	exit(EXIT_SUCCESS);
 }
+#endif
 
