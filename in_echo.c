@@ -16,10 +16,14 @@
 #include <netdb.h>
 
 #define BUFSZ 100
-#define THREADLIM 100
+#define THREADLIM 1
 #define BKLOG 20
 
-void *echo(void *arg) {
+static pthread_mutex_t active_threads_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int active_threads;
+
+
+static void *echo(void *arg) {
 	char buf[BUFSZ];
 	int fd, nread;
 
@@ -33,9 +37,12 @@ void *echo(void *arg) {
 	}
 	if (errno != 0)
 		syslog(LOG_ERR, "Error servicing client: %s", strerror(errno));
+	pthread_mutex_lock(&active_threads_mtx);
+	active_threads--;
+	pthread_mutex_unlock(&active_threads_mtx);
 }
 
-int mksock() {
+static int mksock() {
 	struct addrinfo hints, *res, *cur;
 	int sock;
 
@@ -69,7 +76,7 @@ int mksock() {
 
 }
 
-void run_server() {
+static void run_server() {
 	pthread_t thread;
 	int sock, fd;
 	syslog(LOG_INFO, "running");
@@ -86,10 +93,18 @@ void run_server() {
 	syslog(LOG_INFO, "listening socket created");
 	while ((fd = accept(sock, NULL, NULL)) > -1) {
 		syslog(LOG_INFO, "accepted connection...");
-		if (pthread_create(&thread, NULL, echo, (void*)fd) == 0) {
+		pthread_mutex_lock(&active_threads_mtx);
+		if (active_threads >= THREADLIM) {
+			syslog(LOG_ERR, "Too many clients, skipping...");
+			close(fd);
+		}
+		if (pthread_create(&thread, NULL, echo, (void*)fd) != 0) {
 			syslog(LOG_ERR, "Failed to create thread");
+			pthread_mutex_unlock(&active_threads_mtx);
 			continue;
 		}
+		active_threads++;
+		pthread_mutex_unlock(&active_threads_mtx);
 		syslog(LOG_INFO, "detatched thread to handle child");
 		if(pthread_detach(thread) == -1) {
 			syslog(LOG_ERR, "Failed to detach thread, exiting");
