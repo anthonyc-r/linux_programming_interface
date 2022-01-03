@@ -18,12 +18,11 @@
 
 static void client(char *host, char *port, char *cmd) {
 	int sock;
-	size_t  cmd_sz;
+	size_t  cmd_sz, nread;
 	struct sockaddr_storage addr;
 	struct addrinfo *res, *curs, hints;
 	char buf[100];
 
-	printf("client: %s\n", cmd);
 	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
 		perror("socket");
 		exit(EXIT_FAILURE);
@@ -58,12 +57,36 @@ static void client(char *host, char *port, char *cmd) {
 		exit(EXIT_FAILURE);
 	}
 	shutdown(sock, SHUT_WR);
-	sendfile(STDOUT_FILENO, sock, NULL, 1000000);
+	while ((nread = read(sock, buf, 100)) > 0) {
+		write(STDOUT_FILENO, buf, nread);
+	}
 }
 
-static void execmd(int fd, char *cmd) {
+static void execmd(int fd, int sock, char *cmd) {
+	char *envp[1];
+	char *argv[4];
+
 	printf("exec command %s\n", cmd);
-	write(fd, "ayylmao", 8);
+	switch (fork()) {
+	case -1:
+		perror("fork");
+		break;
+	case 0:
+		close(sock);
+		close(STDIN_FILENO);
+		dup2(fd, STDOUT_FILENO);
+		dup2(fd, STDERR_FILENO);
+		envp[0] = NULL;
+		argv[3] = NULL;
+		argv[0] = "sh";
+		argv[1] = "-c";
+		argv[2] = cmd;
+		execve("/bin/sh", argv, envp);
+		perror("execve");
+		exit(EXIT_FAILURE);
+	default:
+		break;
+	}
 	close(fd);
 }
 
@@ -101,7 +124,8 @@ static void serv() {
 	
 	while ((client = accept(sock, NULL, NULL)) != -1) {
 		puts("Accepting client");
-		if (read(client, command, CMD_SZ) == -1) {
+		memset(command, 0, CMD_SZ);
+		if (read(client, command, CMD_SZ - 1) == -1) {
 			close(client);
 			continue;
 		}
@@ -110,7 +134,7 @@ static void serv() {
 			close(client);
 			continue;
 		}
-		execmd(client, command);
+		execmd(client, sock, command);
 	}
 	close(sock);
 	closelog();
