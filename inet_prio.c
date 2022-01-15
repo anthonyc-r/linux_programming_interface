@@ -10,12 +10,15 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <errno.h>
+#include <sys/select.h>
 
 #define BUFSZ 100
 #define NAMESZ 50
 #define PORTSZ 10
+#define SMALL_BUFSZ 10
 #ifndef MIN
 #define MIN(A,B) (A < B ? A : B)
+#define MAX(A,B) (A < B ? B : A)
 #endif
 
 static void exit_err(char *reason) {
@@ -25,7 +28,7 @@ static void exit_err(char *reason) {
 
 static int get_sock(char *addr, char *port) {
 	struct addrinfo hints, *res, *addrp;
-	int sock, ires;
+	int sock, ires, optval;
 
 	memset(&hints, 0, sizeof (hints));
 	hints.ai_family = AF_UNSPEC;
@@ -48,6 +51,9 @@ static int get_sock(char *addr, char *port) {
 				addrp->ai_protocol);
 		if (sock > -1) {
 			if (addr == NULL) {
+				optval = 1;
+				setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+						&optval, sizeof (optval));
 				ires = bind(sock, addrp->ai_addr, addrp->ai_addrlen);
 			} else {
 				ires = connect(sock, addrp->ai_addr, addrp->ai_addrlen);
@@ -68,7 +74,32 @@ static int get_sock(char *addr, char *port) {
 }
 
 static void handle_client(int client[2]) {
+	fd_set rset, wset, eset;
+	char buf[SMALL_BUFSZ];
+	int nfds;
 
+	FD_ZERO(&rset);
+	FD_ZERO(&wset);
+	FD_ZERO(&eset);
+	FD_SET(client[0], &rset);
+	FD_SET(client[1], &rset);
+	nfds = MAX(client[0], client[1]) + 1;
+	while (pselect(nfds, &rset, &wset, &eset, NULL, NULL) != -1) {
+		if (FD_ISSET(client[1], &rset)) {
+			if (read(client[1], buf, SMALL_BUFSZ) < 1)
+				break;
+			buf[SMALL_BUFSZ - 1] = '\0';
+			printf("!!PRIO!! - %s\n", buf);
+		} else if (FD_ISSET(client[0], &rset)) {
+			if (read(client[0], buf, SMALL_BUFSZ) < 1)
+				break;
+			buf[SMALL_BUFSZ - 1] = '\0';
+			printf("%s\n");
+		}
+		FD_ZERO(&rset);
+		FD_SET(client[0], &rset);
+		FD_SET(client[1], &rset);
+	}
 }
 
 static void server(char *port) {
@@ -92,12 +123,13 @@ static void server(char *port) {
 		ires = getnameinfo((struct sockaddr*)&caddr, clen, cname, 
 				NAMESZ, cport, PORTSZ, NI_NUMERICHOST | 
 				NI_NUMERICSERV);
-		if (ires == -1) {
-			puts("Failed to get client nameinfo");
+		if (ires != 0) {
+			puts(gai_strerror(ires));
+			perror("Failed to get client nameinfo");
 			continue;
 		}
-		if ((client[1] = get_sock(cname, cport)) == -1) {
-			puts("Failed to connect to prio sock");
+		if ((client[1] = get_sock(cname, buf)) == -1) {
+			perror("Failed to connect to prio sock");
 			continue;
 		}
 		puts("Ready to handle client!");
@@ -108,24 +140,42 @@ static void server(char *port) {
 }
 
 static void client(char *addr, char *port) {
-	int sock, prio, ires;
+	int sock, prio, ires, priofd;
 	char pport[PORTSZ];
+	char buf[BUFSZ];
 	struct sockaddr_storage sock_addr;
 	socklen_t alen;
 
 	if ((prio = get_sock(NULL, "0")) == -1)
 		exit_err("Failed to get priority sock");
+	if (listen(prio, 10) == -1)
+		exit_err("failed to listen on prio sock");
 	if ((sock = get_sock(addr, port)) == -1)
 		exit_err("Failed to get normal sock");
+	alen = sizeof (sock_addr);
 	ires = getsockname(prio, (struct sockaddr*)&sock_addr, &alen);
 	if (ires == -1)
 		exit_err("Couldn't get prio sock addr");
 	ires = getnameinfo((struct sockaddr*)&sock_addr, alen, NULL, 0, 
 			pport, PORTSZ, NI_NUMERICHOST | NI_NUMERICSERV);
-	if (ires == -1)
+	if (ires != 0) {
+		puts(gai_strerror(ires));
 		exit_err("Couldn't get prio name info");
+	}
+	printf("Writing port number %s to server\n", pport);
 	write(sock, pport, MIN(strlen(pport), PORTSZ));
-	sleep(10);
+	priofd = accept(prio, NULL, NULL);
+	if (priofd == -1)
+		exit_err("failed to accept priority connection from serv");
+	puts("established prio connection");
+	for (;;) {
+		read(STDIN_FILENO, buf, BUFSZ);
+		// If user input starts with ! send it via the priority channel
+		if (buf[0] == '!')
+			write(priofd, buf, BUFSZ);
+		else
+			write(sock, buf, BUFSZ);
+	}
 }
 
 int main(int argc, char **argv) {
