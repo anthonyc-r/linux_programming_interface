@@ -13,6 +13,8 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <time.h>
+#include <string.h>
 
 #define BUFSZ 100
 
@@ -47,6 +49,25 @@ static void run_child(char *sname) {
 	close(slave);
 	execl("/bin/bash", "bash", (char*)NULL);
 	exit_err("exec");
+}
+
+static int log_time(int ofile, int finished) {
+	time_t t;
+	char *str, *intro;
+	size_t len;
+
+	intro = finished ? "Script finished on: " : "Script started on: ";
+
+	if (time(&t) == (time_t)-1)
+		return -1;
+	if ((str = ctime(&t)) == NULL)
+		return -1;
+	len = strlen(intro);
+	if (write(ofile, intro, len) != (ssize_t)len)
+		return -1;
+	len = strlen(str);
+	if (write(ofile, str, len) != (ssize_t)len)
+		return -1;
 }
 
 int main(int argc, char **argv) {
@@ -95,6 +116,7 @@ int main(int argc, char **argv) {
 	fds[FD_PT].events = POLLIN;
 	fds[FD_IO].fd = STDIN_FILENO;
 	fds[FD_IO].events = POLLIN;
+	log_time(ofile, 0);
 	while (poll(fds, 2, -1) > 0) {
 		if (fds[FD_PT].revents & POLLIN) {
 			if ((nread = read(master, buf, BUFSZ)) > 0) {
@@ -107,7 +129,8 @@ int main(int argc, char **argv) {
 		} else if (fds[FD_IO].revents & POLLHUP) {
 			exit_err("STDIN HUP");
 		} else if (fds[FD_PT].revents & POLLHUP) {
-			exit_err("PT HUP");
+			log_time(ofile, 1);
+			exit(EXIT_SUCCESS);
 		}
 	}
 	perror("poll");
