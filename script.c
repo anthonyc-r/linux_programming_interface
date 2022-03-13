@@ -15,10 +15,12 @@
 #include <termios.h>
 #include <time.h>
 #include <string.h>
+#include <signal.h>
 
 #define BUFSZ 100
 
 static struct termios tios_restore;
+static volatile sig_atomic_t winch;
 
 static void exit_err(char *reason) {
 	perror(reason);
@@ -70,8 +72,32 @@ static int log_time(int ofile, int finished) {
 		return -1;
 }
 
+static void handle(int sig) {
+	winch = 1;
+}
+
+static int setup_winch() {
+	struct sigaction sigact;
+
+	memset(&sigact, 0, sizeof (sigact));
+	sigact.sa_handler = handle;
+	sigemptyset(&sigact.sa_mask);
+	sigact.sa_flags = 0;
+	if (sigaction(SIGWINCH, &sigact, NULL) == -1)
+		return -1;
+}
+
+static int winchpt(int master) {
+	struct winsize sz;
+
+	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &sz) == -1)
+		return -1;
+	if (ioctl(master, TIOCSWINSZ, &sz) == -1)
+		return -1;
+}
+
 int main(int argc, char **argv) {
-	int master, ofile;
+	int master, ofile, result;
 	char *sname, buf[BUFSZ];
 	struct pollfd fds[2];
 	struct termios raw;
@@ -79,6 +105,8 @@ int main(int argc, char **argv) {
 
 	if (argc < 2)
 		exit_err("usage: ./script <output_file>");
+	if (setup_winch() == -1)
+		exit_err("setup sigwinch");
 	if ((ofile = open(argv[1], O_WRONLY | O_CREAT, S_IRWXU)) == -1)
 		exit_err("failed to open output file");
 	if ((master = posix_openpt(O_RDWR | O_NOCTTY)) < 0)
@@ -117,7 +145,17 @@ int main(int argc, char **argv) {
 	fds[FD_IO].fd = STDIN_FILENO;
 	fds[FD_IO].events = POLLIN;
 	log_time(ofile, 0);
-	while (poll(fds, 2, -1) > 0) {
+	for (;;) {
+		result = poll(fds, 2, -1);
+		if (result == -1) {
+			if (winch) {
+				if (winchpt(master) == -1)
+					exit_err("Update pt win size");
+				winch = 0;
+			} else {
+				exit_err("poll");
+			}
+		}
 		if (fds[FD_PT].revents & POLLIN) {
 			if ((nread = read(master, buf, BUFSZ)) > 0) {
 				write(STDOUT_FILENO, buf, nread);
@@ -133,11 +171,6 @@ int main(int argc, char **argv) {
 			exit(EXIT_SUCCESS);
 		}
 	}
-	perror("poll");
 #undef FD_PT
 #undef FD_IO
-	close(master);
-	close(ofile);
-
-	exit(EXIT_SUCCESS);
 }
