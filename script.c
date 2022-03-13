@@ -27,18 +27,22 @@ static void restore_tios() {
 	tcsetattr(STDOUT_FILENO, TCSADRAIN, &tios_restore);
 }
 
-static void run_child(int slave) {
+static void run_child(char *sname) {
+	int slave;
+
 	if (setsid() == (pid_t)-1)
 		exit_err("setsid");
+	if ((slave = open(sname, O_RDWR)) == -1)
+		exit_err("open pt slave");
 	if (ioctl(slave, TIOCSCTTY) == -1)
 		exit_err("TIOCSTTY");
-	close(STDIN_FILENO);
-	close(STDOUT_FILENO);
-	close(STDERR_FILENO);
-	if (dup2(slave, STDIN_FILENO) || dup2(slave, STDOUT_FILENO) ||
-		dup2(slave, STDERR_FILENO) != 0) {
-
-		exit_err("dup2");
+	if (dup2(slave, STDIN_FILENO) == -1)
+		exit_err("dup2 STDIN");
+	if (dup2(slave, STDOUT_FILENO) == -1)
+		exit_err("dup2 STDOUT");
+	if (dup2(slave, STDERR_FILENO) == -1) {
+		puts("dup2 STDERR");
+		exit_err("dup2 STDERR");
 	}
 	close(slave);
 	execl("/bin/bash", "bash", (char*)NULL);
@@ -46,7 +50,7 @@ static void run_child(int slave) {
 }
 
 int main(int argc, char **argv) {
-	int master, slave, ofile;
+	int master, ofile;
 	char *sname, buf[BUFSZ];
 	struct pollfd fds[2];
 	struct termios raw;
@@ -64,18 +68,14 @@ int main(int argc, char **argv) {
 		exit_err("ptsname");
 	if (unlockpt(master) == -1)
 		exit_err("unlockpt");
-	if ((slave = open(sname, O_RDWR)) == -1)
-		exit_err("open slave device");
 	switch(fork()) {
 		case -1:
 			exit_err("fork");
 		case 0:
-			run_child(slave);
-			break;
+			run_child(sname);
 		default:
 			break;
 	}
-	close(slave);
 	if (tcgetattr(STDOUT_FILENO, &tios_restore) == -1)
 		exit_err("tcgetattr");
 	if (atexit(restore_tios) != 0)
@@ -95,27 +95,25 @@ int main(int argc, char **argv) {
 	fds[FD_PT].events = POLLIN;
 	fds[FD_IO].fd = STDIN_FILENO;
 	fds[FD_IO].events = POLLIN;
-	while (poll(fds, master + 1, 0) > 0) {
-		if (fds[FD_PT].revents & POLLIN != 0) {
-			if ((nread = read(master, buf, BUFSZ)) > 0)
+	while (poll(fds, 2, -1) > 0) {
+		if (fds[FD_PT].revents & POLLIN) {
+			if ((nread = read(master, buf, BUFSZ)) > 0) {
 				write(STDOUT_FILENO, buf, nread);
-			else
-				exit_err("read from pt failed");
-		}
-		if (fds[FD_IO].revents & POLLIN != 0) {
-			if ((nread = read(STDIN_FILENO, buf, BUFSZ)) > 0) {
-				write(master, buf, nread);
 				write(ofile, buf, nread);
-			} else {
-				exit_err("read from STDIN failed");
 			}
-
+		} else if (fds[FD_IO].revents & POLLIN) {
+			if ((nread = read(STDIN_FILENO, buf, BUFSZ)) > 0)
+				write(master, buf, nread);
+		} else if (fds[FD_IO].revents & POLLHUP) {
+			exit_err("STDIN HUP");
+		} else if (fds[FD_PT].revents & POLLHUP) {
+			exit_err("PT HUP");
 		}
 	}
+	perror("poll");
 #undef FD_PT
 #undef FD_IO
 	close(master);
-	close(slave);
 	close(ofile);
 
 	exit(EXIT_SUCCESS);
