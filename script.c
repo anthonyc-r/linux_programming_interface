@@ -2,6 +2,8 @@
  * Basic implementation of script(1).
  * Runs $SHELL under a pseudoterminal slave, the master then outputs
  * all input (where echoed) and output to the specified file.
+ * This updated version (see git log) uses cat and tee programs, instead of
+ * handling IO redirection ourselves via select.
  */
 
 #define _XOPEN_SOURCE 600
@@ -16,6 +18,8 @@
 #include <time.h>
 #include <string.h>
 #include <signal.h>
+#include <errno.h>
+#include <sys/wait.h>
 
 #define BUFSZ 100
 
@@ -97,17 +101,18 @@ static int winchpt(int master) {
 }
 
 int main(int argc, char **argv) {
-	int master, ofile, result;
+	int master, ofile, result, wstat;
 	char *sname, buf[BUFSZ];
 	struct pollfd fds[2];
 	struct termios raw;
 	ssize_t nread;
+	pid_t tee, cat, wpid;
 
 	if (argc < 2)
 		exit_err("usage: ./script <output_file>");
 	if (setup_winch() == -1)
 		exit_err("setup sigwinch");
-	if ((ofile = open(argv[1], O_WRONLY | O_CREAT, S_IRWXU)) == -1)
+	if ((ofile = open(argv[1], O_WRONLY | O_CREAT | O_APPEND, S_IRWXU)) == -1)
 		exit_err("failed to open output file");
 	if ((master = posix_openpt(O_RDWR | O_NOCTTY)) < 0)
 		exit_err("posix_openpt");
@@ -138,39 +143,49 @@ int main(int argc, char **argv) {
 	raw.c_cc[VTIME] = 0;
 	if (tcsetattr(STDOUT_FILENO, TCSADRAIN, &raw) == -1)
 		exit_err("tcsetattr raw");
-#define FD_PT 0
-#define FD_IO 1
-	fds[FD_PT].fd = master;
-	fds[FD_PT].events = POLLIN;
-	fds[FD_IO].fd = STDIN_FILENO;
-	fds[FD_IO].events = POLLIN;
+
 	log_time(ofile, 0);
+	fsync(ofile);
+	switch ((tee = fork())) {
+		case -1:
+			exit_err("fork");
+		case 0:
+			dup2(master, STDIN_FILENO);
+			execl("/bin/tee", "tee", "-a", argv[1], (char*)NULL);
+			exit_err("tee");
+		default:
+			break;
+	}
+	switch ((cat = fork())) {
+		case -1:
+			exit_err("cat");
+		case 0:
+			dup2(master, STDOUT_FILENO);
+			execl("/bin/cat", "cat", (char*)NULL);
+			exit_err("cat");
+		default:
+			break;
+	}
+	// Monitor our child procs
 	for (;;) {
-		result = poll(fds, 2, -1);
-		if (result == -1) {
-			if (winch) {
-				if (winchpt(master) == -1)
-					exit_err("Update pt win size");
-				winch = 0;
-			} else {
-				exit_err("poll");
+		if ((wpid = wait(&wstat)) == -1) {
+			switch (errno) {
+				case ECHILD:
+					fsync(ofile);
+					log_time(ofile, 1);
+					exit(EXIT_SUCCESS);
+				case EINTR:
+					continue;
+				default:
+					kill(cat, SIGINT);
+					kill(tee, SIGINT);
+					exit_err("wait");
 			}
-		}
-		if (fds[FD_PT].revents & POLLIN) {
-			if ((nread = read(master, buf, BUFSZ)) > 0) {
-				write(STDOUT_FILENO, buf, nread);
-				write(ofile, buf, nread);
-			}
-		} else if (fds[FD_IO].revents & POLLIN) {
-			if ((nread = read(STDIN_FILENO, buf, BUFSZ)) > 0)
-				write(master, buf, nread);
-		} else if (fds[FD_IO].revents & POLLHUP) {
-			exit_err("STDIN HUP");
-		} else if (fds[FD_PT].revents & POLLHUP) {
-			log_time(ofile, 1);
-			exit(EXIT_SUCCESS);
+		// Tee should be the first to quit, but just in case.
+		} else if (wpid == cat) {
+			kill(tee, SIGINT);
+		} else if (wpid == tee) {
+			kill(cat, SIGINT);
 		}
 	}
-#undef FD_PT
-#undef FD_IO
 }
