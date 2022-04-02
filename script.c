@@ -1,7 +1,8 @@
 /**
- * Basic implementation of script(1).
+ * Replayable implementation of script(1).
  * Runs $SHELL under a pseudoterminal slave, the master then outputs
- * all input (where echoed) and output to the specified file.
+ * all input (where echoed) and output to the specified file. Each output is timestamped
+ * so that it can be replayed.
  */
 
 #define _XOPEN_SOURCE 600
@@ -21,6 +22,7 @@
 
 static struct termios tios_restore;
 static volatile sig_atomic_t winch;
+static unsigned long long smillis;
 
 static void exit_err(char *reason) {
 	perror(reason);
@@ -96,15 +98,57 @@ static int winchpt(int master) {
 		return -1;
 }
 
+static int get_millis(unsigned long long *out) {
+	struct timespec ts;
+	if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
+		return -1;
+	*out = (unsigned long long)ts.tv_sec * 1000L;
+	*out += (unsigned long long)(ts.tv_nsec / 1000000L);
+}
+static int timestamp(int fd) {
+	unsigned long long millis, diff;
+	int nprint;
+
+	if (get_millis(&millis) == -1)
+		return -1;
+	if (millis < smillis)
+		return -1;
+	diff = smillis - millis;
+	write(fd, "\n", 1);
+	write(fd, &diff, sizeof (diff));
+	return 0;
+}
+
+static int escape(char *in, int ilen, char *out, int olen) {
+	int i, j;
+	char c;
+
+	for (i = 0, j = 0; i < ilen && j < olen; j++, i++) {
+		if (in[i] == '\n') {
+			out[j++] = '\\';
+			out[j] = 'n';
+		} else if (i < (ilen - 1) && in[i + 1] == 'n' && in[i] == '\\') {
+			out[j++] = '\\';
+			out[j++] = '\\';
+			out[j] = 'n';
+		} else {
+			out[j] = in[i];
+		}
+	}
+	return j;
+}
+
 int main(int argc, char **argv) {
 	int master, ofile, result;
-	char *sname, buf[BUFSZ];
+	char *sname, buf[BUFSZ], escbuf[2 * BUFSZ];
 	struct pollfd fds[2];
 	struct termios raw;
 	ssize_t nread;
 
 	if (argc < 2)
 		exit_err("usage: ./script <output_file>");
+	if (get_millis(&smillis) == -1)
+		exit_err("setup start millis");
 	if (setup_winch() == -1)
 		exit_err("setup sigwinch");
 	if ((ofile = open(argv[1], O_WRONLY | O_CREAT, S_IRWXU)) == -1)
@@ -159,6 +203,8 @@ int main(int argc, char **argv) {
 		if (fds[FD_PT].revents & POLLIN) {
 			if ((nread = read(master, buf, BUFSZ)) > 0) {
 				write(STDOUT_FILENO, buf, nread);
+				timestamp(ofile);
+				nread = escape(buf, nread, escbuf, 2 * BUFSZ);
 				write(ofile, buf, nread);
 			}
 		} else if (fds[FD_IO].revents & POLLIN) {
