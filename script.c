@@ -3,6 +3,11 @@
  * Runs $SHELL under a pseudoterminal slave, the master then outputs
  * all input (where echoed) and output to the specified file. Each output is timestamped
  * so that it can be replayed.
+ * For the sake of simplicity, this doesn't output the human readable <ts> <space> <line> <nl>
+ * format suggested in the exercise...
+ * Usage:
+ * Record a shell session: ./script <output_file>
+ * Replay a previously recorded session: ./script <previously_output_file> replay
  */
 
 #define _XOPEN_SOURCE 600
@@ -31,6 +36,24 @@ static void exit_err(char *reason) {
 
 static void restore_tios() {
 	tcsetattr(STDOUT_FILENO, TCSADRAIN, &tios_restore);
+}
+
+static void setraw() {
+	struct termios raw;
+
+	if (tcgetattr(STDOUT_FILENO, &tios_restore) == -1)
+		exit_err("tcgetattr");
+	if (atexit(restore_tios) != 0)
+		exit_err("atexit");
+	raw = tios_restore;
+	raw.c_lflag &= ~(ICANON | ISIG | IEXTEN | ECHO);
+	raw.c_iflag &= ~(BRKINT | ICRNL | IGNBRK | IGNCR | INLCR |
+		INPCK | ISTRIP | IXON | PARMRK);
+	raw.c_oflag &= ~OPOST;
+	raw.c_cc[VMIN] = 1;
+	raw.c_cc[VTIME] = 0;
+	if (tcsetattr(STDOUT_FILENO, TCSADRAIN, &raw) == -1)
+		exit_err("tcsetattr raw");
 }
 
 static void run_child(char *sname) {
@@ -105,6 +128,15 @@ static int get_millis(unsigned long long *out) {
 	*out = (unsigned long long)ts.tv_sec * 1000L;
 	*out += (unsigned long long)(ts.tv_nsec / 1000000L);
 }
+static unsigned long long get_elapsed(unsigned long long since) {
+	struct timespec ts;
+	unsigned long long current;
+	if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
+		return -1;
+	current = (unsigned long long)ts.tv_sec * 1000L;
+	current += (unsigned long long)(ts.tv_nsec / 1000000L);
+	return current - since;
+}
 static int timestamp(int fd) {
 	unsigned long long millis, diff;
 	int nprint;
@@ -113,46 +145,19 @@ static int timestamp(int fd) {
 		return -1;
 	if (millis < smillis)
 		return -1;
-	diff = smillis - millis;
-	write(fd, "\n", 1);
+	diff = millis - smillis;
 	write(fd, &diff, sizeof (diff));
 	return 0;
 }
 
-static int escape(char *in, int ilen, char *out, int olen) {
-	int i, j;
-	char c;
-
-	for (i = 0, j = 0; i < ilen && j < olen; j++, i++) {
-		if (in[i] == '\n') {
-			out[j++] = '\\';
-			out[j] = 'n';
-		} else if (i < (ilen - 1) && in[i + 1] == 'n' && in[i] == '\\') {
-			out[j++] = '\\';
-			out[j++] = '\\';
-			out[j] = 'n';
-		} else {
-			out[j] = in[i];
-		}
-	}
-	return j;
-}
-
-int main(int argc, char **argv) {
-	int master, ofile, result;
-	char *sname, buf[BUFSZ], escbuf[2 * BUFSZ];
+static void record(int ofile) {
 	struct pollfd fds[2];
-	struct termios raw;
+	char buf[BUFSZ], *sname;
 	ssize_t nread;
+	int result, master;
 
-	if (argc < 2)
-		exit_err("usage: ./script <output_file>");
-	if (get_millis(&smillis) == -1)
-		exit_err("setup start millis");
 	if (setup_winch() == -1)
 		exit_err("setup sigwinch");
-	if ((ofile = open(argv[1], O_WRONLY | O_CREAT, S_IRWXU)) == -1)
-		exit_err("failed to open output file");
 	if ((master = posix_openpt(O_RDWR | O_NOCTTY)) < 0)
 		exit_err("posix_openpt");
 	if (grantpt(master) == -1)
@@ -169,26 +174,14 @@ int main(int argc, char **argv) {
 		default:
 			break;
 	}
-	if (tcgetattr(STDOUT_FILENO, &tios_restore) == -1)
-		exit_err("tcgetattr");
-	if (atexit(restore_tios) != 0)
-		exit_err("atexit");
-	raw = tios_restore;
-	raw.c_lflag &= ~(ICANON | ISIG | IEXTEN | ECHO);
-	raw.c_iflag &= ~(BRKINT | ICRNL | IGNBRK | IGNCR | INLCR |
-		INPCK | ISTRIP | IXON | PARMRK);
-	raw.c_oflag &= ~OPOST;
-	raw.c_cc[VMIN] = 1;
-	raw.c_cc[VTIME] = 0;
-	if (tcsetattr(STDOUT_FILENO, TCSADRAIN, &raw) == -1)
-		exit_err("tcsetattr raw");
+	setraw();
+
 #define FD_PT 0
 #define FD_IO 1
 	fds[FD_PT].fd = master;
 	fds[FD_PT].events = POLLIN;
 	fds[FD_IO].fd = STDIN_FILENO;
 	fds[FD_IO].events = POLLIN;
-	log_time(ofile, 0);
 	for (;;) {
 		result = poll(fds, 2, -1);
 		if (result == -1) {
@@ -204,7 +197,7 @@ int main(int argc, char **argv) {
 			if ((nread = read(master, buf, BUFSZ)) > 0) {
 				write(STDOUT_FILENO, buf, nread);
 				timestamp(ofile);
-				nread = escape(buf, nread, escbuf, 2 * BUFSZ);
+				write(ofile, &nread, sizeof (nread));
 				write(ofile, buf, nread);
 			}
 		} else if (fds[FD_IO].revents & POLLIN) {
@@ -213,10 +206,53 @@ int main(int argc, char **argv) {
 		} else if (fds[FD_IO].revents & POLLHUP) {
 			exit_err("STDIN HUP");
 		} else if (fds[FD_PT].revents & POLLHUP) {
-			log_time(ofile, 1);
 			exit(EXIT_SUCCESS);
 		}
 	}
 #undef FD_PT
 #undef FD_IO
+}
+
+static void replay(int ifile) {
+	ssize_t nread;
+	ssize_t len;
+	char buf[BUFSZ];
+	unsigned long long millis, elapsed;
+
+	while ((nread = read(ifile, &millis, sizeof (millis))) > 0) {
+		if ((nread = read(ifile, &len, sizeof (len))) == -1)
+			break;
+		if ((nread = read(ifile, buf, len)) == -1)
+			break;
+		for (;;) {
+			elapsed = get_elapsed(smillis);
+			if (elapsed < millis) {
+				usleep(50000);
+				continue;
+			}
+			write(STDOUT_FILENO, buf, nread);
+			break;
+		}
+	}
+	if (nread == -1)
+		exit_err("read ifile");
+}
+
+int main(int argc, char **argv) {
+	int file, rplay;
+
+	if (argc < 2)
+		exit_err("usage: ./script <output_file> | <input_file> replay");
+	rplay = argc > 2;
+
+	if (get_millis(&smillis) == -1)
+		exit_err("setup start millis");
+	if ((file = open(argv[1], O_RDWR | O_CREAT, S_IRWXU)) == -1)
+		exit_err("failed to open output file");
+
+	if (rplay) {
+		replay(file);
+	} else {
+		record(file);
+	}
 }
