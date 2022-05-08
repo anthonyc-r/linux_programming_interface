@@ -1,0 +1,8 @@
+open test.txt
+set i=5
+label loop_start
+write hello
+decr i
+if i>0
+goto loop_start
+save
